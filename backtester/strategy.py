@@ -55,6 +55,20 @@ class OrderBookLevel(NamedTuple):
     size: float
 
 
+class StoredBook(NamedTuple):
+    """Internal container for a parsed book snapshot in the loader.
+
+    Same GC-reason as OrderBookLevel: this holds the yes+no books plus the
+    source ts, and we create ~877K of them during timeline build. Making it
+    a NamedTuple keeps the collector uninterested.
+
+    Consumers access fields by name (`.yes_book`, `.no_book`, `.book_ts`).
+    """
+    yes_book: "OrderBookSnapshot"
+    no_book: "OrderBookSnapshot"
+    book_ts: int
+
+
 _EMPTY_BIDS: tuple[OrderBookLevel, ...] = ()
 _EMPTY_ASKS: tuple[OrderBookLevel, ...] = ()
 

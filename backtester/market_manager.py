@@ -110,11 +110,20 @@ class MarketManager:
         """
         enriched: dict[str, MarketView] = {}
 
+        _empty = OrderBookSnapshot()
         for slug, view in views.items():
-            # Get order book data
-            books = tick.order_books.get(slug, {})
-            yes_book = books.get("yes_book", OrderBookSnapshot())
-            no_book = books.get("no_book", OrderBookSnapshot())
+            # Get order book data (StoredBook NamedTuple, or None if absent)
+            snap = tick.order_books.get(slug)
+            if snap is None:
+                yes_book = _empty
+                no_book = _empty
+            elif isinstance(snap, dict):
+                # legacy path (used by conftest fixtures)
+                yes_book = snap.get("yes_book", _empty)
+                no_book = snap.get("no_book", _empty)
+            else:
+                yes_book = snap.yes_book
+                no_book = snap.no_book
 
             # Get price data from market_prices
             price_row = tick.market_prices.get(slug, {})

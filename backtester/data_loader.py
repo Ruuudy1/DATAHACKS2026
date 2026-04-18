@@ -25,6 +25,7 @@ from .strategy import (
     OrderBookLevel,
     OrderBookSnapshot,
     Settlement,
+    StoredBook,
     Token,
 )
 
@@ -694,17 +695,17 @@ def build_timeline(
                 for row in grp.itertuples(index=False, name=None):
                     bts = int(row[ts_i])
                     ts_list.append(bts)
-                    snap_dict[bts] = {
-                        "yes_book": OrderBookSnapshot.from_json(
+                    snap_dict[bts] = StoredBook(
+                        yes_book=OrderBookSnapshot.from_json(
                             str(row[ybi]) if ybi is not None else "[]",
                             str(row[yai]) if yai is not None else "[]",
                         ),
-                        "no_book": OrderBookSnapshot.from_json(
+                        no_book=OrderBookSnapshot.from_json(
                             str(row[nbi]) if nbi is not None else "[]",
                             str(row[nai]) if nai is not None else "[]",
                         ),
-                        "book_ts": bts,
-                    }
+                        book_ts=bts,
+                    )
                     parsed += 1
                     if parsed % progress_every == 0:
                         logger.info(f"  parsed {parsed:,}/{len(slim):,} books")
@@ -783,12 +784,10 @@ def build_timeline(
                     last_books[slug] = snap
 
             if slug in last_books:
-                # Reuse the parsed last_books dict by reference — don't allocate
-                # a new per-tick dict. For 9 active markets * 641K ticks that's
-                # 5.8M dict allocations avoided (and 5.8M GC-tracked objects).
+                # Reuse the parsed StoredBook tuple — no per-tick allocation.
                 snap = last_books[slug]
                 tick.order_books[slug] = snap
-                tick.book_timestamps[slug] = snap["book_ts"]
+                tick.book_timestamps[slug] = snap.book_ts
 
             # Synthesize order books from bid/ask when no JSONL data
             elif slug in slugs_need_synthetic and slug in tick.market_prices:
@@ -798,11 +797,11 @@ def build_timeline(
                 no_bid = float(pdict.get("no_bid", 0))
                 no_ask = float(pdict.get("no_ask", 0))
                 if yes_bid > 0 or yes_ask > 0:
-                    snap = {
-                        "yes_book": _synthesize_book(yes_bid, yes_ask),
-                        "no_book": _synthesize_book(no_bid, no_ask),
-                        "book_ts": ts,
-                    }
+                    snap = StoredBook(
+                        yes_book=_synthesize_book(yes_bid, yes_ask),
+                        no_book=_synthesize_book(no_bid, no_ask),
+                        book_ts=ts,
+                    )
                     last_books[slug] = snap
                     tick.order_books[slug] = snap
                     tick.book_timestamps[slug] = ts
