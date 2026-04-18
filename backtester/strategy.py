@@ -18,7 +18,7 @@ except ImportError:
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, NamedTuple
 
 
 # ── Enums ────────────────────────────────────────────────────────────────────
@@ -43,18 +43,30 @@ class MarketStatus(str, Enum):
 # ── Order Book ───────────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True)
-class OrderBookLevel:
-    """A single price level in an order book."""
+class OrderBookLevel(NamedTuple):
+    """A single price level in an order book.
+
+    Defined as a NamedTuple (not a dataclass) so instances are NOT tracked
+    by the garbage collector. We create ~9M of these per backtest; a GC
+    sweep over tracked instances cost 2+ minutes. NamedTuples of atoms
+    (float, float) are immutable and untracked, eliminating that cost.
+    """
     price: float
     size: float
 
 
-@dataclass(frozen=True)
-class OrderBookSnapshot:
-    """Full order book snapshot for one side (YES or NO) of a market."""
-    bids: tuple[OrderBookLevel, ...] = ()  # sorted descending by price
-    asks: tuple[OrderBookLevel, ...] = ()  # sorted ascending by price
+_EMPTY_BIDS: tuple[OrderBookLevel, ...] = ()
+_EMPTY_ASKS: tuple[OrderBookLevel, ...] = ()
+
+
+class OrderBookSnapshot(NamedTuple):
+    """Full order book snapshot for one side (YES or NO) of a market.
+
+    NamedTuple for the same GC-tracking reason as OrderBookLevel.
+    Methods are kept on the class (NamedTuple supports them fine).
+    """
+    bids: tuple[OrderBookLevel, ...] = _EMPTY_BIDS   # sorted descending by price
+    asks: tuple[OrderBookLevel, ...] = _EMPTY_ASKS   # sorted ascending by price
 
     @property
     def best_bid(self) -> float:
@@ -100,7 +112,7 @@ class OrderBookSnapshot:
             return OrderBookSnapshot()
         bids = tuple(OrderBookLevel(float(p), float(s)) for p, s in raw_bids)
         asks = tuple(OrderBookLevel(float(p), float(s)) for p, s in raw_asks)
-        return OrderBookSnapshot(bids=bids, asks=asks)
+        return OrderBookSnapshot(bids, asks)
 
 
 # ── Market View ──────────────────────────────────────────────────────────────
