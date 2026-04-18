@@ -585,32 +585,54 @@ def build_timeline(
     global_start = int(prices_df["ts_sec"].min())
     global_end = int(prices_df["ts_sec"].max())
 
-    # Pre-aggregate Binance to per-second (BTC only)
+    # Pre-aggregate Binance to per-second (BTC only).
+    # The Parquet schema has bid_price_1/ask_price_1 (no `mid_price` column),
+    # so derive mid/spread on the fly.
     binance_by_sec: dict[int, tuple[float, float]] = {}
-    if not binance_df.empty and "mid_price" in binance_df.columns:
+    if not binance_df.empty and "bid_price_1" in binance_df.columns and "ask_price_1" in binance_df.columns:
         btc_lob = binance_df[binance_df["asset"] == "BTC"] if "asset" in binance_df.columns else binance_df
         if not btc_lob.empty:
-            binance_agg = btc_lob.groupby("ts_sec").agg(
-                btc_mid=("mid_price", "last"),
-                btc_spread=("spread", "last"),
+            btc_lob = btc_lob.assign(
+                _mid=(btc_lob["bid_price_1"] + btc_lob["ask_price_1"]) / 2,
+                _spread=(btc_lob["ask_price_1"] - btc_lob["bid_price_1"]),
             )
-            for ts, row in binance_agg.iterrows():
-                binance_by_sec[int(ts)] = (float(row["btc_mid"]), float(row["btc_spread"]))
+            binance_agg = btc_lob.groupby("ts_sec").agg(
+                btc_mid=("_mid", "last"),
+                btc_spread=("_spread", "last"),
+            )
+            # Vectorised dict build — iterrows is ~20x slower at this scale.
+            binance_by_sec = dict(
+                zip(
+                    binance_agg.index.astype(int).tolist(),
+                    zip(
+                        binance_agg["btc_mid"].astype(float).tolist(),
+                        binance_agg["btc_spread"].astype(float).tolist(),
+                    ),
+                )
+            )
 
     # Pre-aggregate Chainlink to per-second
     chainlink_by_sec: dict[int, float] = {}
     if not chainlink_df.empty:
         cl_agg = chainlink_df.groupby("ts_sec").agg(chainlink_btc=("price", "last"))
-        for ts, row in cl_agg.iterrows():
-            chainlink_by_sec[int(ts)] = float(row["chainlink_btc"])
+        chainlink_by_sec = dict(
+            zip(
+                cl_agg.index.astype(int).tolist(),
+                cl_agg["chainlink_btc"].astype(float).tolist(),
+            )
+        )
 
-    # Group prices by ts_sec for fast lookup
+    # Group prices by ts_sec for fast lookup.
+    # `to_dict('records')` is ~20x faster than iterrows() on large frames.
     prices_grouped: dict[int, dict] = {}
-    for _, row in prices_df.iterrows():
-        ts = int(row["ts_sec"])
-        if ts not in prices_grouped:
-            prices_grouped[ts] = {}
-        prices_grouped[ts][row["market_slug"]] = row.to_dict()
+    for rec in prices_df.to_dict("records"):
+        ts = int(rec["ts_sec"])
+        slug = rec["market_slug"]
+        bucket = prices_grouped.get(ts)
+        if bucket is None:
+            bucket = {}
+            prices_grouped[ts] = bucket
+        bucket[slug] = rec
 
     # Filter books_df to requested assets too (skip parsing SOL/ETH order books)
     if assets and not books_df.empty and "market_slug" in books_df.columns:
@@ -619,36 +641,97 @@ def build_timeline(
             lambda s: _asset_from_slug(s) in asset_set
         )]
 
-    # Pre-index order books by slug for efficient lookup
-    # Build pre-parsed book snapshots indexed by (slug, ts) for O(1) forward-fill
+    # Pre-index order books by slug for efficient lookup.
+    # Build pre-parsed book snapshots indexed by (slug, ts) for O(1) forward-fill.
+    # CRITICAL: use groupby() once, not 8,466 linear-scan filters.
+    #
+    # Parsing ~1.75M order-book JSON payloads takes ~90s, dominating cold start.
+    # Cache the parsed structure to disk (keyed by books.csv mtime+size) so only
+    # the FIRST backtest on a given data dir pays that cost.
     import bisect
+    import pickle
     books_by_slug: dict[str, Any] = {}
-    book_ts_index: dict[str, list[int]] = {}  # slug -> sorted list of timestamps
-    book_snapshots: dict[str, dict[int, dict]] = {}  # slug -> {ts -> {yes_book, no_book}}
-    if not books_df.empty:
-        for slug in all_slugs:
-            slug_books = books_df[books_df["market_slug"] == slug].copy()
-            if not slug_books.empty:
-                slug_books = slug_books.sort_values("ts_sec").reset_index(drop=True)
-                books_by_slug[slug] = slug_books
-                ts_list = []
-                snap_dict = {}
-                for _, row in slug_books.iterrows():
-                    bts = int(row["ts_sec"])
-                    ts_list.append(bts)
-                    snap_dict[bts] = {
-                        "yes_book": OrderBookSnapshot.from_json(
-                            str(row.get("yes_bids_json", "[]")),
-                            str(row.get("yes_asks_json", "[]")),
-                        ),
-                        "no_book": OrderBookSnapshot.from_json(
-                            str(row.get("no_bids_json", "[]")),
-                            str(row.get("no_asks_json", "[]")),
-                        ),
-                        "book_ts": bts,
-                    }
-                book_ts_index[slug] = ts_list
-                book_snapshots[slug] = snap_dict
+    book_ts_index: dict[str, list[int]] = {}
+    book_snapshots: dict[str, dict[int, dict]] = {}
+
+    _csv_files = sorted(books_dir.glob("*.csv")) if books_dir.exists() else []
+    _cache_sig = (
+        tuple(f.name for f in _csv_files),
+        tuple(f.stat().st_size for f in _csv_files),
+        tuple(int(f.stat().st_mtime) for f in _csv_files),
+        tuple(sorted(_a.upper() for _a in (assets or []))),
+    )
+    _cache_path = books_dir.parent / ".books_cache.pkl" if books_dir.exists() else None
+
+    _cache_loaded = False
+    if _cache_path and _cache_path.exists():
+        try:
+            with open(_cache_path, "rb") as _f:
+                _cached = pickle.load(_f)
+            if _cached.get("sig") == _cache_sig:
+                book_ts_index = _cached["book_ts_index"]
+                book_snapshots = _cached["book_snapshots"]
+                books_by_slug = {s: None for s in book_ts_index}
+                logger.info(
+                    f"Loaded {sum(len(v) for v in book_ts_index.values()):,} "
+                    f"book snapshots from cache"
+                )
+                _cache_loaded = True
+        except Exception as e:
+            logger.warning(f"Book cache read failed ({e}); rebuilding")
+
+    if not _cache_loaded and not books_df.empty:
+        logger.info("Parsing order-book JSON (one-time; cached afterwards)...")
+        # Pre-extract the columns we need to avoid pandas .get() overhead per row.
+        book_cols = [
+            "ts_sec", "market_slug",
+            "yes_bids_json", "yes_asks_json",
+            "no_bids_json", "no_asks_json",
+        ]
+        available = [c for c in book_cols if c in books_df.columns]
+        slim = books_df[available].sort_values(["market_slug", "ts_sec"])
+        for slug, grp in slim.groupby("market_slug", sort=False):
+            ts_list: list[int] = []
+            snap_dict: dict[int, dict] = {}
+            col_idx = {c: i for i, c in enumerate(grp.columns)}
+            ts_i = col_idx["ts_sec"]
+            ybi = col_idx.get("yes_bids_json")
+            yai = col_idx.get("yes_asks_json")
+            nbi = col_idx.get("no_bids_json")
+            nai = col_idx.get("no_asks_json")
+            for row in grp.itertuples(index=False, name=None):
+                bts = int(row[ts_i])
+                ts_list.append(bts)
+                snap_dict[bts] = {
+                    "yes_book": OrderBookSnapshot.from_json(
+                        str(row[ybi]) if ybi is not None else "[]",
+                        str(row[yai]) if yai is not None else "[]",
+                    ),
+                    "no_book": OrderBookSnapshot.from_json(
+                        str(row[nbi]) if nbi is not None else "[]",
+                        str(row[nai]) if nai is not None else "[]",
+                    ),
+                    "book_ts": bts,
+                }
+            books_by_slug[slug] = grp
+            book_ts_index[slug] = ts_list
+            book_snapshots[slug] = snap_dict
+
+        if _cache_path is not None:
+            try:
+                with open(_cache_path, "wb") as _f:
+                    pickle.dump(
+                        {
+                            "sig": _cache_sig,
+                            "book_ts_index": book_ts_index,
+                            "book_snapshots": book_snapshots,
+                        },
+                        _f,
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+                logger.info(f"Cached book snapshots to {_cache_path}")
+            except Exception as e:
+                logger.warning(f"Book cache write failed ({e}); continuing without cache")
 
     # Track which slugs have JSONL books vs need synthetic
     slugs_with_books = set(books_by_slug.keys())
