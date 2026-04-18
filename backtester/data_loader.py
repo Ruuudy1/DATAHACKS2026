@@ -783,11 +783,12 @@ def build_timeline(
                     last_books[slug] = snap
 
             if slug in last_books:
-                tick.order_books[slug] = {
-                    "yes_book": last_books[slug]["yes_book"],
-                    "no_book": last_books[slug]["no_book"],
-                }
-                tick.book_timestamps[slug] = last_books[slug]["book_ts"]
+                # Reuse the parsed last_books dict by reference — don't allocate
+                # a new per-tick dict. For 9 active markets * 641K ticks that's
+                # 5.8M dict allocations avoided (and 5.8M GC-tracked objects).
+                snap = last_books[slug]
+                tick.order_books[slug] = snap
+                tick.book_timestamps[slug] = snap["book_ts"]
 
             # Synthesize order books from bid/ask when no JSONL data
             elif slug in slugs_need_synthetic and slug in tick.market_prices:
@@ -797,18 +798,14 @@ def build_timeline(
                 no_bid = float(pdict.get("no_bid", 0))
                 no_ask = float(pdict.get("no_ask", 0))
                 if yes_bid > 0 or yes_ask > 0:
-                    yes_book = _synthesize_book(yes_bid, yes_ask)
-                    no_book = _synthesize_book(no_bid, no_ask)
-                    tick.order_books[slug] = {
-                        "yes_book": yes_book,
-                        "no_book": no_book,
-                    }
-                    tick.book_timestamps[slug] = ts
-                    last_books[slug] = {
-                        "yes_book": yes_book,
-                        "no_book": no_book,
+                    snap = {
+                        "yes_book": _synthesize_book(yes_bid, yes_ask),
+                        "no_book": _synthesize_book(no_bid, no_ask),
                         "book_ts": ts,
                     }
+                    last_books[slug] = snap
+                    tick.order_books[slug] = snap
+                    tick.book_timestamps[slug] = ts
 
         # Binance BTC (forward-fill)
         if ts in binance_by_sec:
